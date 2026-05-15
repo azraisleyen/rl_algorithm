@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 import json
 import time
 import subprocess
@@ -27,6 +27,9 @@ class ExperimentConfig:
     evaluator: str = "surrogate"
     surrogate_model_name: str = "S-1D"
     surrogate_checkpoint_path: str = "checkpoints/surrogate_s1d.pt"
+    scaler_x_path: str = "checkpoints/scaler_x.pkl"
+    scaler_y_path: str = "checkpoints/scaler_y.pkl"
+    rl_checkpoint_path: str = "checkpoints/td3_model.zip"
     seed: int = 42
     total_timesteps: int = 200_000
     episode_max_steps: int = 25
@@ -53,14 +56,14 @@ def create_run_dir(base: Path, algorithm: str) -> Path:
     return run_dir
 
 
-def write_experiment_metadata(cfg: ExperimentConfig, run_dir: Path, rl_checkpoint_path: str, normalization_stats: Dict) -> None:
+def write_experiment_metadata(cfg: ExperimentConfig, run_dir: Path, normalization_stats: Dict) -> None:
     metadata = {
         "experiment_id": run_dir.name,
         "algorithm": cfg.algorithm.upper(),
         "evaluator": cfg.evaluator,
         "surrogate_model_name": cfg.surrogate_model_name,
         "surrogate_checkpoint_path": cfg.surrogate_checkpoint_path,
-        "rl_checkpoint_path": rl_checkpoint_path,
+        "rl_checkpoint_path": cfg.rl_checkpoint_path,
         "seed": cfg.seed,
         "total_timesteps": cfg.total_timesteps,
         "episode_max_steps": cfg.episode_max_steps,
