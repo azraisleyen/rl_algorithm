@@ -14,8 +14,7 @@ def build_parser():
         sp.add_argument("--evaluator", default="surrogate", choices=["surrogate", "xfoil"])
         sp.add_argument("--surrogate-model-name", default="S-1D", choices=["S-1D", "S-2D", "S-3D"])
         sp.add_argument("--surrogate-checkpoint-path", default="checkpoints/surrogate_s1d.pt")
-        sp.add_argument("--scaler-x-path", default="checkpoints/scaler_x.pkl")
-        sp.add_argument("--scaler-y-path", default="checkpoints/scaler_y.pkl")
+        sp.add_argument("--scaler-json-path", default="checkpoints/scalers.json")
         sp.add_argument("--rl-checkpoint-path", default="checkpoints/td3_surrogate_s-1d.zip")
         sp.add_argument("--seed", type=int, default=42)
         sp.add_argument("--total-timesteps", type=int, default=200000)
@@ -39,8 +38,7 @@ def to_cfg(args):
         evaluator=args.evaluator,
         surrogate_model_name=args.surrogate_model_name,
         surrogate_checkpoint_path=args.surrogate_checkpoint_path,
-        scaler_x_path=args.scaler_x_path,
-        scaler_y_path=args.scaler_y_path,
+        scaler_json_path=args.scaler_json_path,
         rl_checkpoint_path=args.rl_checkpoint_path,
         seed=args.seed,
         total_timesteps=args.total_timesteps,

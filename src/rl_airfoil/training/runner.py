@@ -17,8 +17,7 @@ def _make_evaluator(cfg: ExperimentConfig):
         return SurrogateEvaluator(
             checkpoint_path=cfg.surrogate_checkpoint_path,
             model_name=cfg.surrogate_model_name,
-            scaler_x_path=cfg.scaler_x_path,
-            scaler_y_path=cfg.scaler_y_path,
+            scaler_json_path=cfg.scaler_json_path,
         )
     if cfg.evaluator.lower() == "xfoil":
         return XFOILEvaluator()
@@ -39,7 +38,7 @@ def train_td3(cfg: ExperimentConfig, base_logs: Path = Path("logs"), checkpoints
     model.save(str(ckpt))
     cfg.rl_checkpoint_path = str(ckpt)
 
-    write_experiment_metadata(cfg, run_dir, normalization_stats={"input": "scaler_x.pkl", "target": "scaler_y.pkl"})
+    write_experiment_metadata(cfg, run_dir, normalization_stats={"source": cfg.scaler_json_path})
     (run_dir / "training_update_logs.csv").write_text(
         "update_id,critic_loss_Q1,critic_loss_Q2,actor_loss,target_Q_mean,target_Q_std,Q1_mean,Q2_mean,policy_delay_step,learning_rate_actor,learning_rate_critic,gradient_norm_actor,gradient_norm_critic\n",
         encoding="utf-8",

@@ -11,13 +11,14 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## 2) Surrogate model dosyalarını yerleştirme
+## 2) Surrogate dosyalarını yerleştirme
 
-Aşağıdaki dosyaları `checkpoints/` altına koyun:
+`checkpoints/` klasörüne koyun:
 
 - `surrogate_s1d.pt` (veya s2d/s3d)
-- `scaler_x.pkl`
-- `scaler_y.pkl`
+- `scalers.json`
+
+> `scalers.json` içinde `x_mean`, `x_scale`, `y_mean`, `y_std`, `use_log_re` alanları kullanılmaktadır.
 
 ## 3) TD3 eğitim
 
@@ -27,8 +28,7 @@ python -m src.main train \
   --evaluator surrogate \
   --surrogate-model-name S-1D \
   --surrogate-checkpoint-path checkpoints/surrogate_s1d.pt \
-  --scaler-x-path checkpoints/scaler_x.pkl \
-  --scaler-y-path checkpoints/scaler_y.pkl \
+  --scaler-json-path checkpoints/scalers.json \
   --seed 42 \
   --total-timesteps 200000
 ```
@@ -41,8 +41,7 @@ python -m src.main evaluate \
   --evaluator surrogate \
   --surrogate-model-name S-1D \
   --surrogate-checkpoint-path checkpoints/surrogate_s1d.pt \
-  --scaler-x-path checkpoints/scaler_x.pkl \
-  --scaler-y-path checkpoints/scaler_y.pkl \
+  --scaler-json-path checkpoints/scalers.json \
   --rl-checkpoint-path checkpoints/td3_surrogate_s-1d.zip \
   --run-dir logs/td3/run_<id> \
   --episodes 10 \
@@ -51,7 +50,7 @@ python -m src.main evaluate \
 
 ## 5) XFOIL evaluator ile çalışma
 
-Aynı komutlarda `--evaluator xfoil` seçerek doğrudan solver değiştirin.
+Aynı komutlarda `--evaluator xfoil` seçerek çözücüyü değiştirin.
 
 ## 6) Üretilen XAI logları
 

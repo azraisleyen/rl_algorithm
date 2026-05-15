@@ -27,8 +27,7 @@ class ExperimentConfig:
     evaluator: str = "surrogate"
     surrogate_model_name: str = "S-1D"
     surrogate_checkpoint_path: str = "checkpoints/surrogate_s1d.pt"
-    scaler_x_path: str = "checkpoints/scaler_x.pkl"
-    scaler_y_path: str = "checkpoints/scaler_y.pkl"
+    scaler_json_path: str = "checkpoints/scalers.json"
     rl_checkpoint_path: str = "checkpoints/td3_model.zip"
     seed: int = 42
     total_timesteps: int = 200_000
