@@ -17,7 +17,7 @@ class AirfoilEnv(gym.Env):
         self.evaluator = evaluator
         self.max_steps = cfg.episode_max_steps
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(8,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(15,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(16,), dtype=np.float32)
         self.step_count = 0
         self.cst = np.zeros(8, dtype=np.float32)
         self.last_aero = None

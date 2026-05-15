@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import json
+import zipfile
 import numpy as np
 import torch
 
@@ -64,16 +65,23 @@ class SurrogateEvaluator(Evaluator):
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(f"Surrogate checkpoint not found: {self.checkpoint_path}")
 
-        try:
-            ckpt = torch.load(self.checkpoint_path, map_location=self.device)
-            if isinstance(ckpt, torch.nn.Module):
-                model = ckpt
-            elif isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], torch.nn.Module):
-                model = ckpt["model"]
-            else:
+        if zipfile.is_zipfile(self.checkpoint_path):
+            try:
                 model = torch.jit.load(str(self.checkpoint_path), map_location=self.device)
-        except Exception:
-            model = torch.jit.load(str(self.checkpoint_path), map_location=self.device)
+                model.eval()
+                return model
+            except Exception:
+                pass
+
+        ckpt = torch.load(self.checkpoint_path, map_location=self.device)
+        if isinstance(ckpt, torch.nn.Module):
+            model = ckpt
+        elif isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], torch.nn.Module):
+            model = ckpt["model"]
+        else:
+            raise TypeError(
+                "Unsupported checkpoint format. Expected TorchScript archive or a torch checkpoint containing nn.Module."
+            )
 
         model.eval()
         return model
