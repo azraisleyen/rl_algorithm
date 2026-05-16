@@ -1,6 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 import time
+import json
 import numpy as np
 import pandas as pd
 from stable_baselines3 import TD3
@@ -43,11 +44,7 @@ class TrainingMetricsCallback(BaseCallback):
 
 def _make_evaluator(cfg: ExperimentConfig):
     if cfg.evaluator.lower() == "surrogate":
-        return SurrogateEvaluator(
-            checkpoint_path=cfg.surrogate_checkpoint_path,
-            model_name=cfg.surrogate_model_name,
-            scaler_json_path=cfg.scaler_json_path,
-        )
+        return SurrogateEvaluator(cfg.surrogate_checkpoint_path, cfg.surrogate_model_name, cfg.scaler_json_path)
     if cfg.evaluator.lower() == "xfoil":
         return XFOILEvaluator()
     raise ValueError(f"Unsupported evaluator: {cfg.evaluator}")
@@ -64,11 +61,11 @@ def _write_replay_sample(model: TD3, run_dir: Path, sample_n: int = 5000):
     for i in idxs:
         rows.append({
             "buffer_index": int(i),
-            "state_t": rb.observations[i].tolist(),
-            "action_t": rb.actions[i].tolist(),
-            "reward_t": float(rb.rewards[i]),
-            "next_state_t": rb.next_observations[i].tolist(),
-            "done_t": float(rb.dones[i]),
+            "state_t": np.asarray(rb.observations[i]).reshape(-1).tolist(),
+            "action_t": np.asarray(rb.actions[i]).reshape(-1).tolist(),
+            "reward_t": float(np.asarray(rb.rewards[i]).reshape(-1)[0]),
+            "next_state_t": np.asarray(rb.next_observations[i]).reshape(-1).tolist(),
+            "done_t": float(np.asarray(rb.dones[i]).reshape(-1)[0]),
             "sampling_weight": 1.0,
         })
     pd.DataFrame(rows).to_csv(run_dir / "replay_sample_logs.csv", index=False)
@@ -94,11 +91,9 @@ def train_td3(cfg: ExperimentConfig, base_logs: Path = Path("logs"), checkpoints
 
     write_experiment_metadata(cfg, run_dir, normalization_stats={"source": cfg.scaler_json_path, "train_wall_time_sec": train_wall_time})
     pd.DataFrame(cb.rows).to_csv(run_dir / "training_update_logs.csv", index=False)
-
     _write_replay_sample(model, run_dir)
 
-    # Auto evaluation so all required files are always created right after training.
-    evaluate_td3(cfg, run_dir, episodes=10, aoa_sweep="-2,0,2,4,6,8")
+    # evaluate ayrı komutla çalıştırılacak; train sadece eğitim artefact'larını üretir.
     return run_dir
 
 
@@ -125,6 +120,7 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Path, episodes: int = 10, aoa_s
     summaries = []
     global_step = 0
     best_record = None
+    eval_start = time.time()
 
     for ep in range(episodes):
         obs, _ = env.reset(seed=cfg.seed + ep)
@@ -136,6 +132,7 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Path, episodes: int = 10, aoa_s
         best_clcd = -1e9
         initial_clcd = float(obs[14])
         last_info = None
+
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs_t = model.policy.obs_to_tensor(obs)[0]
@@ -144,9 +141,7 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Path, episodes: int = 10, aoa_s
             nxt, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
 
-            upper = float(np.linalg.norm(action[:4]))
-            lower = float(np.linalg.norm(action[4:]))
-            norm = float(np.linalg.norm(action))
+            norm = float(np.linalg.norm(action)); upper = float(np.linalg.norm(action[:4])); lower = float(np.linalg.norm(action[4:]))
             row = {"experiment_id": run_dir.name, "algorithm": "TD3", "evaluator": cfg.evaluator, "seed": cfg.seed, "episode_id": ep, "step_id": step, "global_step": global_step,
                    "AoA": cfg.aoa, "Re": cfg.re, "log10_Re": np.log10(cfg.re), "CL": info["CL"], "CD": info["CD"], "CM": info["CM"], "CL_CD": info["CL_CD"], "t_c": info["t_c"],
                    "CL_pred": info["CL"], "CD_pred": info["CD"], "CM_pred": info["CM"], "CL_CD_pred": info["CL_CD"],
@@ -156,8 +151,7 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Path, episodes: int = 10, aoa_s
                    "penalty_total": info["reward_CM_penalty"] + info["reward_tc_penalty"],
                    "CM_lower_violation": info["CM_lower_violation"], "CM_upper_violation": info["CM_upper_violation"], "tc_lower_violation": info["tc_lower_violation"], "tc_upper_violation": info["tc_upper_violation"], "local_thickness_violation": 0.0,
                    "done": done, "truncated": truncated, "terminated": terminated, "done_reason": info["done_reason"],
-                   "action_norm": norm, "upper_action_norm": upper, "lower_action_norm": lower, "action_max_abs": float(np.max(np.abs(action))), "action_saturation_count": int(np.sum(np.abs(action) >= 0.999)),
-                   }
+                   "action_norm": norm, "upper_action_norm": upper, "lower_action_norm": lower, "action_max_abs": float(np.max(np.abs(action))), "action_saturation_count": int(np.sum(np.abs(action) >= 0.999))}
             for i in range(4):
                 row[f"state_CST_u{i+1}"] = float(obs[i]); row[f"state_CST_l{i+1}"] = float(obs[4+i])
                 row[f"action_u{i+1}"] = float(action[i]); row[f"action_l{i+1}"] = float(action[4+i])
@@ -167,7 +161,7 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Path, episodes: int = 10, aoa_s
 
             q1v = float(q1.detach().cpu().numpy().ravel()[0]); q2v = float(q2.detach().cpu().numpy().ravel()[0])
             policy.log({"episode_id": ep, "step_id": step, **{f"actor_action_u{i+1}": float(action[i]) for i in range(4)}, **{f"actor_action_l{i+1}": float(action[4+i]) for i in range(4)},
-                        "Q1": q1v, "Q2": q2v, "Q_min": min(q1v,q2v), "Q_disagreement": abs(q1v-q2v), "target_Q": "", "td_error_Q1": "", "td_error_Q2": ""})
+                        "Q1": q1v, "Q2": q2v, "Q_min": min(q1v, q2v), "Q_disagreement": abs(q1v-q2v), "target_Q": "", "td_error_Q1": "", "td_error_Q2": ""})
 
             total_reward += reward
             penalties += info["reward_CM_penalty"] + info["reward_tc_penalty"]
@@ -194,26 +188,25 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Path, episodes: int = 10, aoa_s
     rollout.close(); policy.close()
     pd.DataFrame(summaries).to_csv(run_dir / "episode_summary.csv", index=False)
 
-    xeval = XFOILEvaluator()
+    # only current evaluator AoA sweep (no cross-validation)
     sweep_rows = []
     if best_record is not None:
         aoa_values = [float(x) for x in aoa_sweep.split(",") if x.strip()]
         cst = best_record["cst"]
-        surrogate_eval = _make_evaluator(cfg)
+        evaltor = _make_evaluator(cfg)
         for a in aoa_values:
-            tms = time.time()
-            s = surrogate_eval.evaluate(cst, a, cfg.re)
-            x = xeval.evaluate(cst, a, cfg.re)
-            x_runtime = (time.time() - tms) * 1000.0
-            s_ratio = s.cl / max(s.cd, cfg.cd_lower_bound)
-            x_ratio = x.cl / max(x.cd, cfg.cd_lower_bound)
+            t0 = time.time()
+            out = evaltor.evaluate(cst, a, cfg.re)
+            runtime_ms = (time.time() - t0) * 1000.0
+            ratio = out.cl / max(out.cd, cfg.cd_lower_bound)
             sweep_rows.append({
-                "algorithm": "TD3", "episode_id": best_record["episode_id"], "step_id": best_record["step_id"],
+                "algorithm": "TD3", "evaluator": cfg.evaluator, "episode_id": best_record["episode_id"], "step_id": best_record["step_id"],
                 "AoA": a, "Re": cfg.re,
                 **{f"CST_u{i+1}": float(cst[i]) for i in range(4)}, **{f"CST_l{i+1}": float(cst[4+i]) for i in range(4)},
-                "CL_surrogate": s.cl, "CD_surrogate": s.cd, "CM_surrogate": s.cm, "CL_CD_surrogate": s_ratio,
-                "CL_xfoil": x.cl, "CD_xfoil": x.cd, "CM_xfoil": x.cm, "CL_CD_xfoil": x_ratio,
-                "abs_error_CL": abs(s.cl - x.cl), "abs_error_CD": abs(s.cd - x.cd), "abs_error_CM": abs(s.cm - x.cm), "abs_error_CL_CD": abs(s_ratio - x_ratio),
-                "xfoil_converged": True, "xfoil_iterations": "", "xfoil_error_message": "", "xfoil_runtime_ms": x_runtime,
+                "CL_pred": out.cl, "CD_pred": out.cd, "CM_pred": out.cm, "CL_CD_pred": ratio,
+                "xfoil_converged": True if cfg.evaluator == "xfoil" else "", "xfoil_iterations": "", "xfoil_error_message": "", "runtime_ms": runtime_ms,
             })
     pd.DataFrame(sweep_rows).to_csv(run_dir / "xfoil_validation_logs.csv", index=False)
+
+    with open(run_dir / "eval_summary.json", "w", encoding="utf-8") as f:
+        json.dump({"eval_wall_time_sec": time.time() - eval_start, "episodes": episodes, "aoa_sweep": aoa_sweep}, f, indent=2)
