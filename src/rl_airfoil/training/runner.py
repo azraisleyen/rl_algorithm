@@ -4,6 +4,8 @@ import time
 import json
 import numpy as np
 import pandas as pd
+import torch
+from typing import Optional
 from stable_baselines3 import TD3
 from stable_baselines3.common.noise import NormalActionNoise
 from stable_baselines3.common.callbacks import BaseCallback
@@ -25,6 +27,7 @@ class TrainingMetricsCallback(BaseCallback):
         self._ep_id = 0
         self._ep_reward = 0.0
         self._ep_len = 0
+        self.last_info = {}
 
     def _on_step(self) -> bool:
         self.update_id += 1
@@ -33,6 +36,7 @@ class TrainingMetricsCallback(BaseCallback):
         dones = bool(np.asarray(self.locals.get("dones", [False])).reshape(-1)[0])
         infos = self.locals.get("infos", [{}])
         info = infos[0] if infos else {}
+        self.last_info = info
         obs = np.asarray(self.locals.get("new_obs", np.zeros((1,16), dtype=np.float32))).reshape(1,-1)[0]
         actions = np.asarray(self.locals.get("actions", np.zeros((1,8), dtype=np.float32))).reshape(1,-1)[0]
         self.train_steps.append({
@@ -95,6 +99,46 @@ def _write_replay_sample(model: TD3, run_dir: Path, sample_n: int = 5000):
     pd.DataFrame(rows).to_csv(run_dir / "replay_sample_logs.csv", index=False)
 
 
+def _write_checkpoint_index(checkpoint_path: Path, run_dir: Path):
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    idx_path = checkpoint_path.parent / "checkpoint_index.json"
+    if idx_path.exists():
+        with open(idx_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = {}
+    data[str(checkpoint_path.resolve())] = str(run_dir.resolve())
+    with open(idx_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def _resolve_train_run_dir_from_checkpoint(rl_checkpoint_path: str, logs_root: Path = Path("logs")) -> Optional[Path]:
+    ckpt = Path(rl_checkpoint_path).resolve()
+    idx_path = ckpt.parent / "checkpoint_index.json"
+    if idx_path.exists():
+        with open(idx_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        run = data.get(str(ckpt))
+        if run:
+            p = Path(run)
+            if p.exists():
+                return p
+    for meta in logs_root.glob("**/experiment_metadata.json"):
+        with open(meta, "r", encoding="utf-8") as f:
+            m = json.load(f)
+        if Path(m.get("rl_checkpoint_path", "")).resolve() == ckpt:
+            return meta.parent
+    return None
+
+
+def _create_eval_run_dir(train_run_dir: Path) -> Path:
+    eval_root = train_run_dir / "eval"
+    eval_root.mkdir(parents=True, exist_ok=True)
+    run_dir = eval_root / f"run_{int(time.time())}"
+    run_dir.mkdir(parents=False, exist_ok=False)
+    return run_dir
+
+
 def train_td3(cfg: ExperimentConfig, base_logs: Path = Path("logs"), checkpoints_dir: Path = Path("checkpoints")) -> Path:
     run_dir = create_run_dir(base_logs, "td3")
     checkpoints_dir.mkdir(exist_ok=True)
@@ -112,18 +156,55 @@ def train_td3(cfg: ExperimentConfig, base_logs: Path = Path("logs"), checkpoints
     ckpt = checkpoints_dir / f"td3_{cfg.evaluator}_{cfg.surrogate_model_name.lower()}.zip"
     model.save(str(ckpt))
     cfg.rl_checkpoint_path = str(ckpt)
+    _write_checkpoint_index(ckpt, run_dir)
 
     write_experiment_metadata(cfg, run_dir, normalization_stats={"source": cfg.scaler_json_path, "train_wall_time_sec": train_wall_time})
     pd.DataFrame(cb.rows).to_csv(run_dir / "training_update_logs.csv", index=False)
     pd.DataFrame(cb.train_steps).to_csv(run_dir / "train_rollout_step_logs.csv", index=False)
     pd.DataFrame(cb.ep_rows).to_csv(run_dir / "train_episode_summary.csv", index=False)
     _write_replay_sample(model, run_dir)
+    train_metrics = {
+        "algorithm": "TD3",
+        "evaluator": cfg.evaluator,
+        "train_wall_time_sec": train_wall_time,
+        "final_CL": cb.last_info.get("CL", np.nan),
+        "final_CD": cb.last_info.get("CD", np.nan),
+        "final_CL_CD": cb.last_info.get("CL_CD", np.nan),
+        "final_CM": cb.last_info.get("CM", np.nan),
+        "final_t_c": cb.last_info.get("t_c", np.nan),
+    }
+    pd.DataFrame([train_metrics]).to_csv(run_dir / "train_metrics.csv", index=False)
+    with open(run_dir / "xai_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "schema_version": "xai_v1",
+                "run_type": "train",
+                "files": [
+                    "experiment_metadata.json",
+                    "training_update_logs.csv",
+                    "train_rollout_step_logs.csv",
+                    "train_episode_summary.csv",
+                    "replay_sample_logs.csv",
+                    "train_metrics.csv",
+                ],
+            },
+            f,
+            indent=2,
+        )
 
     # evaluate ayrı komutla çalıştırılacak; train sadece eğitim artefact'larını üretir.
     return run_dir
 
 
-def evaluate_td3(cfg: ExperimentConfig, run_dir: Path, episodes: int = 10, aoa_sweep: str = "-2,0,2,4,6,8"):
+def evaluate_td3(cfg: ExperimentConfig, run_dir: Optional[Path], episodes: int = 10, aoa_sweep: str = "-2,0,2,4,6,8"):
+    if run_dir is None:
+        train_run = _resolve_train_run_dir_from_checkpoint(cfg.rl_checkpoint_path)
+        if train_run is None:
+            raise FileNotFoundError("Could not resolve train run directory from checkpoint. Please provide --run-dir.")
+        run_dir = _create_eval_run_dir(train_run)
+    else:
+        run_dir.mkdir(parents=True, exist_ok=True)
+
     env = AirfoilEnv(cfg, _make_evaluator(cfg))
     model = TD3.load(cfg.rl_checkpoint_path)
 
@@ -147,6 +228,7 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Path, episodes: int = 10, aoa_s
     global_step = 0
     best_record = None
     eval_start = time.time()
+    aero_wall_time_sec = 0.0
 
     for ep in range(episodes):
         obs, _ = env.reset(seed=cfg.seed + ep)
@@ -162,7 +244,12 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Path, episodes: int = 10, aoa_s
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs_t = model.policy.obs_to_tensor(obs)[0]
-            act_t = model.policy.obs_to_tensor(action)[0]
+            # NOTE:
+            # obs_to_tensor() validates input against *observation_space*.
+            # Passing an action vector here causes a shape mismatch on SB3
+            # (expected obs shape=(16,), got action shape=(8,)).
+            # Build action tensor manually for critic forward pass.
+            act_t = torch.as_tensor(action, dtype=torch.float32, device=obs_t.device).reshape(1, -1)
             q1, q2 = model.critic(obs_t, act_t)
             nxt, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
@@ -191,6 +278,7 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Path, episodes: int = 10, aoa_s
 
             total_reward += reward
             penalties += info["reward_CM_penalty"] + info["reward_tc_penalty"]
+            aero_wall_time_sec += float(info.get("aero_wall_time_step_sec", 0.0))
             action_norms.append(norm)
             best_clcd = max(best_clcd, info["CL_CD"])
             if best_record is None or info["CL_CD"] > best_record["CL_CD"]:
@@ -224,6 +312,7 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Path, episodes: int = 10, aoa_s
             t0 = time.time()
             out = evaltor.evaluate(cst, a, cfg.re)
             runtime_ms = (time.time() - t0) * 1000.0
+            aero_wall_time_sec += runtime_ms / 1000.0
             ratio = out.cl / max(out.cd, cfg.cd_lower_bound)
             sweep_rows.append({
                 "algorithm": "TD3", "evaluator": cfg.evaluator, "episode_id": best_record["episode_id"], "step_id": best_record["step_id"],
@@ -233,6 +322,40 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Path, episodes: int = 10, aoa_s
                 "xfoil_converged": True if cfg.evaluator == "xfoil" else "", "xfoil_iterations": "", "xfoil_error_message": "", "runtime_ms": runtime_ms,
             })
     pd.DataFrame(sweep_rows).to_csv(run_dir / "xfoil_validation_logs.csv", index=False)
+    summary_df = pd.DataFrame(summaries)
+    best_idx = summary_df["best_CL_CD"].astype(float).idxmax() if len(summary_df) else None
+    best_row = summary_df.loc[best_idx] if best_idx is not None else None
+    eval_metrics = {
+        "algorithm": "TD3",
+        "evaluator": cfg.evaluator,
+        "aero_wall_time_sec": aero_wall_time_sec,
+        "eval_wall_time_sec": time.time() - eval_start,
+        "episodes": episodes,
+        "best_CL": float(best_row["final_CL"]) if best_row is not None else np.nan,
+        "best_CD": float(best_row["final_CD"]) if best_row is not None else np.nan,
+        "best_CL_CD": float(best_row["best_CL_CD"]) if best_row is not None else np.nan,
+        "best_CM": float(best_row["final_CM"]) if best_row is not None else np.nan,
+        "best_t_c": float(best_row["final_t_c"]) if best_row is not None else np.nan,
+    }
+    pd.DataFrame([eval_metrics]).to_csv(run_dir / "eval_metrics.csv", index=False)
 
     with open(run_dir / "eval_summary.json", "w", encoding="utf-8") as f:
-        json.dump({"eval_wall_time_sec": time.time() - eval_start, "episodes": episodes, "aoa_sweep": aoa_sweep}, f, indent=2)
+        json.dump({"eval_wall_time_sec": eval_metrics["eval_wall_time_sec"], "aero_wall_time_sec": aero_wall_time_sec, "episodes": episodes, "aoa_sweep": aoa_sweep}, f, indent=2)
+    with open(run_dir / "xai_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "schema_version": "xai_v1",
+                "run_type": "evaluate",
+                "source_checkpoint": cfg.rl_checkpoint_path,
+                "files": [
+                    "rollout_step_logs.csv",
+                    "policy_outputs.csv",
+                    "episode_summary.csv",
+                    "xfoil_validation_logs.csv",
+                    "eval_metrics.csv",
+                    "eval_summary.json",
+                ],
+            },
+            f,
+            indent=2,
+        )

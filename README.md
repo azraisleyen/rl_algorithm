@@ -43,10 +43,10 @@ python -m src.main evaluate \
   --surrogate-checkpoint-path checkpoints/surrogate_s1d.pt \
   --scaler-json-path checkpoints/scalers.json \
   --rl-checkpoint-path checkpoints/td3_surrogate_s-1d.zip \
-  --run-dir logs/td3/run_<id> \
   --episodes 10 \
   --aoa-sweep "-2,0,2,4,6,8"
 ```
+> `--run-dir` verilmezse evaluate çıktıları, checkpoint’in ait olduğu train run klasöründe `eval/run_<timestamp>` altında otomatik oluşturulur.
 
 ## 5) XFOIL evaluator ile çalışma
 
@@ -62,5 +62,8 @@ Her run altında:
 - `episode_summary.csv`
 - `training_update_logs.csv`
 - `xfoil_validation_logs.csv`
+- `train_metrics.csv` (sadece train)
+- `eval_metrics.csv` (sadece evaluate)
+- `xai_manifest.json` (şema ve dosya indeksi)
 
 Run dizinleri otomatik `logs/td3/run_<timestamp>` olarak oluşturulur.
