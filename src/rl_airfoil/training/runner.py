@@ -20,10 +20,34 @@ class TrainingMetricsCallback(BaseCallback):
         super().__init__(verbose=0)
         self.rows = []
         self.update_id = 0
+        self.train_steps = []
+        self.ep_rows = []
+        self._ep_id = 0
+        self._ep_reward = 0.0
+        self._ep_len = 0
 
     def _on_step(self) -> bool:
         self.update_id += 1
         logs = self.model.logger.name_to_value
+        rewards = float(np.asarray(self.locals.get("rewards", [0.0])).reshape(-1)[0])
+        dones = bool(np.asarray(self.locals.get("dones", [False])).reshape(-1)[0])
+        infos = self.locals.get("infos", [{}])
+        info = infos[0] if infos else {}
+        obs = np.asarray(self.locals.get("new_obs", np.zeros((1,16), dtype=np.float32))).reshape(1,-1)[0]
+        actions = np.asarray(self.locals.get("actions", np.zeros((1,8), dtype=np.float32))).reshape(1,-1)[0]
+        self.train_steps.append({
+            "episode_id": self._ep_id, "step_id": self._ep_len,
+            "reward_total": rewards, "done_reason": info.get("done_reason", "running"),
+            "CL": info.get("CL", np.nan), "CD": info.get("CD", np.nan), "CM": info.get("CM", np.nan), "CL_CD": info.get("CL_CD", np.nan), "t_c": info.get("t_c", np.nan),
+            "action_norm": float(np.linalg.norm(actions)),
+            "state": obs.tolist(), "action": actions.tolist()
+        })
+        self._ep_reward += rewards
+        self._ep_len += 1
+        if dones:
+            self.ep_rows.append({"episode_id": self._ep_id, "total_reward": self._ep_reward, "episode_length": self._ep_len, "done_reason": info.get("done_reason", "")})
+            self._ep_id += 1; self._ep_reward = 0.0; self._ep_len = 0
+
         self.rows.append({
             "update_id": self.update_id,
             "critic_loss_Q1": logs.get("train/critic_loss", ""),
@@ -91,6 +115,8 @@ def train_td3(cfg: ExperimentConfig, base_logs: Path = Path("logs"), checkpoints
 
     write_experiment_metadata(cfg, run_dir, normalization_stats={"source": cfg.scaler_json_path, "train_wall_time_sec": train_wall_time})
     pd.DataFrame(cb.rows).to_csv(run_dir / "training_update_logs.csv", index=False)
+    pd.DataFrame(cb.train_steps).to_csv(run_dir / "train_rollout_step_logs.csv", index=False)
+    pd.DataFrame(cb.ep_rows).to_csv(run_dir / "train_episode_summary.csv", index=False)
     _write_replay_sample(model, run_dir)
 
     # evaluate ayrı komutla çalıştırılacak; train sadece eğitim artefact'larını üretir.
