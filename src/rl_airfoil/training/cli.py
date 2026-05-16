@@ -26,7 +26,7 @@ def build_parser():
 
     e = sub.add_parser("evaluate")
     add_common(e)
-    e.add_argument("--run-dir", required=True)
+    e.add_argument("--run-dir", required=False, default=None)
     e.add_argument("--episodes", type=int, default=10)
     e.add_argument("--aoa-sweep", default="-2,0,2,4,6,8")
     return p
@@ -55,5 +55,6 @@ def main():
         run_dir = train_td3(cfg)
         print(run_dir)
     else:
-        evaluate_td3(cfg, Path(args.run_dir), episodes=args.episodes, aoa_sweep=args.aoa_sweep)
-        print(args.run_dir)
+        run_dir = Path(args.run_dir) if args.run_dir else None
+        evaluate_td3(cfg, run_dir, episodes=args.episodes, aoa_sweep=args.aoa_sweep)
+        print(args.run_dir if args.run_dir else "auto-generated")

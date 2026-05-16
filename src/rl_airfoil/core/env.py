@@ -4,6 +4,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 from typing import Dict, Tuple
+import time
 from rl_airfoil.config.schema import ExperimentConfig
 from rl_airfoil.evaluators.base import Evaluator
 
@@ -42,7 +43,9 @@ class AirfoilEnv(gym.Env):
         action = np.asarray(action, dtype=np.float32)
         prev_cst = self.cst.copy()
         self.cst = np.clip(self.cst + action * self.cfg.action_scale, -0.3, 0.3)
+        t0 = time.time()
         aero = self.evaluator.evaluate(self.cst, self.cfg.aoa, self.cfg.re)
+        aero_eval_sec = time.time() - t0
         self.last_aero = aero
 
         cl_cd = aero.cl / max(aero.cd, self.cfg.cd_lower_bound)
@@ -70,6 +73,8 @@ class AirfoilEnv(gym.Env):
             "is_CM_feasible": cm_pen == 0.0,
             "is_tc_feasible": tc_pen == 0.0,
             "is_geometry_valid": aero.is_geometry_valid,
+            "solver_status": aero.solver_status,
+            "aero_wall_time_step_sec": aero_eval_sec,
             "CM_lower_violation": max(0.0, cm_lo - aero.cm),
             "CM_upper_violation": max(0.0, aero.cm - cm_hi),
             "tc_lower_violation": max(0.0, tc_lo - aero.tc),
