@@ -1,0 +1,137 @@
+# =========================
+# Python cache / compiled files
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# Python packaging / build
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# =========================
+# IDE / editor files
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Environment / secrets
+# =========================
+.env
+.env.*
+*.env
+
+# =========================
+# Logs and experiment outputs
+# =========================
+logs/
+runs/
+outputs/
+results/
+artifacts/
+wandb/
+tensorboard/
+mlruns/
+
+# TD3 / PPO / SAC run folders
+run_*/
+logs/**/run_*/
+
+# CSV / JSON experiment logs generated during training/evaluation
+*_logs.csv
+*metrics.csv
+*summary.csv
+experiment_metadata.json
+xai_manifest.json
+
+# =========================
+# RL / surrogate model checkpoints
+# =========================
+checkpoints/*
+!checkpoints/.gitkeep
+!checkpoints/README.md
+
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.joblib
+*.ckpt
+*.zip
+
+# =========================
+# Data / datasets
+# =========================
+data/
+datasets/
+dataset/
+raw_data/
+processed_data/
+external_data/
+
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+*.feather
+
+# =========================
+# Generated figures / reports
+# =========================
+figures/
+plots/
+reports/generated/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+
+# Eğer paper/report PDF'lerini özellikle pushlamak istiyorsan yukarıdaki *.pdf satırını kaldır.
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Test / coverage
+# =========================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# =========================
+# Temporary files
+# =========================
+tmp/
+temp/
+*.tmp
+*.bak
+*.log

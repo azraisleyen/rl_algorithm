@@ -1,4 +1,6 @@
 from __future__ import annotations
+import csv
+import torch.nn.functional as F
 from pathlib import Path
 import time
 import json
@@ -13,68 +15,448 @@ from stable_baselines3.common.callbacks import BaseCallback
 from rl_airfoil.config.schema import ExperimentConfig, create_run_dir, write_experiment_metadata
 from rl_airfoil.core.env import AirfoilEnv
 from rl_airfoil.evaluators.surrogate import SurrogateEvaluator
-from rl_airfoil.evaluators.xfoil import XFOILEvaluator
+# from rl_airfoil.evaluators.xfoil import XFOILEvaluator
 from rl_airfoil.logging.xai_logger import CSVLogger
 
 
-class TrainingMetricsCallback(BaseCallback):
-    def __init__(self):
-        super().__init__(verbose=0)
-        self.rows = []
+def _as_bool(value) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+
+    if value is None:
+        return False
+
+    try:
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+
+    return str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def _safe_get(row, key: str, default=np.nan):
+    if not isinstance(row, dict):
+        return default
+    return row.get(key, default)
+
+
+def _numeric_series(df: pd.DataFrame, col: str) -> pd.Series:
+    if col not in df.columns:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(df[col], errors="coerce")
+
+
+def _bool_series(df: pd.DataFrame, col: str) -> pd.Series:
+    if col not in df.columns:
+        return pd.Series(False, index=df.index)
+    return df[col].map(_as_bool)
+
+class TD3TrainingDiagnosticsCallback(BaseCallback):
+    """
+    TD3 için XAI uyumlu training callback.
+
+    Bu callback iki işi birlikte yapar:
+    1. Her environment step'i için train_rollout_step_logs.csv verisini RAM'de tutar.
+    2. Belirli aralıklarla replay buffer'dan batch örnekleyerek
+       training_update_logs.csv içine TD3 critic/actor diagnostic metriklerini yazar.
+    """
+
+    def __init__(
+        self,
+        log_path: Path,
+        cfg=None,
+        log_every: int = 100,
+        batch_size: int = 256,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+
+        self.log_path = Path(log_path)
+        self.cfg = cfg
+        self.log_every = int(log_every)
+        self.batch_size = int(batch_size)
         self.update_id = 0
+
+        self.columns = [
+            "update_id",
+            "critic_loss_Q1",
+            "critic_loss_Q2",
+            "actor_loss",
+            "target_Q_mean",
+            "target_Q_std",
+            "Q1_mean",
+            "Q2_mean",
+            "policy_delay_step",
+            "learning_rate_actor",
+            "learning_rate_critic",
+            "gradient_norm_actor",
+            "gradient_norm_critic",
+        ]
+
+        # Eski runner.py sonunda kullanılan attribute.
         self.train_steps = []
-        self.ep_rows = []
-        self._ep_id = 0
-        self._ep_reward = 0.0
-        self._ep_len = 0
+
+        # Olası eski isimlerle uyumlu olsun diye birkaç alias bırakıyoruz.
+        self.episode_rows = []
+
+        # Eski runner.py attribute isimleriyle uyumluluk için alias'lar
+        self.ep_rows = self.episode_rows
+        self.episodes = self.episode_rows
+        self.episode_summaries = self.episode_rows
+        self.train_episodes = self.episode_rows
+
+        self._episode_id = 0
+        self._episode_step = 0
+        self._episode_reward = 0.0
+        self._episode_penalty = 0.0
+        self._episode_violation_count = 0
+        self._episode_best_cl_cd = -float("inf")
+        self._episode_initial_cl_cd = None
+        # Son environment step'inden gelen info bilgisini train_metrics için saklar.
         self.last_info = {}
+        self.last_step_row = {}
+
+    def _on_training_start(self) -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.log_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.columns)
+            writer.writeheader()
+
+    @staticmethod
+    def _first(value, default=None):
+        if value is None:
+            return default
+        if isinstance(value, (list, tuple)):
+            return value[0] if len(value) > 0 else default
+        if isinstance(value, np.ndarray):
+            if value.shape == ():
+                return value.item()
+            return value[0]
+        return value
+
+    @staticmethod
+    def _float(value, default=0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _bool(value) -> bool:
+        try:
+            if isinstance(value, np.ndarray):
+                return bool(value.item()) if value.shape == () else bool(value[0])
+            return bool(value)
+        except Exception:
+            return False
+
+    def _current_lr(self, optimizer) -> float:
+        try:
+            return float(optimizer.param_groups[0]["lr"])
+        except Exception:
+            return float("nan")
+
+    def _grad_norm(self, module: torch.nn.Module) -> float:
+        total_sq = 0.0
+        has_grad = False
+
+        for param in module.parameters():
+            if param.grad is not None:
+                has_grad = True
+                grad_norm = float(param.grad.detach().data.norm(2).cpu())
+                total_sq += grad_norm ** 2
+
+        if not has_grad:
+            return float("nan")
+
+        return float(total_sq ** 0.5)
+
+    def _log_train_rollout_step(self) -> None:
+        infos = self.locals.get("infos", [{}])
+        info = self._first(infos, default={}) or {}
+
+        # train_td3 sonunda train_metrics üretmek için son step bilgisini sakla.
+        if isinstance(info, dict):
+            self.last_info = dict(info)
+        else:
+            self.last_info = {}
+
+        rewards = self.locals.get("rewards", [info.get("reward_total", 0.0)])
+        dones = self.locals.get("dones", [False])
+        actions = self.locals.get("actions", None)
+
+        reward_value = self._float(self._first(rewards, info.get("reward_total", 0.0)))
+        done = self._bool(self._first(dones, False))
+
+        action = self._first(actions, default=np.zeros(8, dtype=np.float32))
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+
+        prev_cst = np.asarray(info.get("prev_cst", np.full(8, np.nan)), dtype=np.float32).reshape(-1)
+        next_cst = np.asarray(info.get("next_cst", np.full(8, np.nan)), dtype=np.float32).reshape(-1)
+        delta_cst = np.asarray(info.get("delta_cst", next_cst - prev_cst), dtype=np.float32).reshape(-1)
+
+        if prev_cst.size < 8:
+            prev_cst = np.pad(prev_cst, (0, 8 - prev_cst.size), constant_values=np.nan)
+        if next_cst.size < 8:
+            next_cst = np.pad(next_cst, (0, 8 - next_cst.size), constant_values=np.nan)
+        if delta_cst.size < 8:
+            delta_cst = np.pad(delta_cst, (0, 8 - delta_cst.size), constant_values=np.nan)
+        if action.size < 8:
+            action = np.pad(action, (0, 8 - action.size), constant_values=np.nan)
+
+        cl_cd = self._float(info.get("CL_CD", 0.0))
+        penalty_total = self._float(info.get("penalty_total", 0.0))
+
+        if self._episode_step == 0:
+            self._episode_initial_cl_cd = cl_cd
+
+        self._episode_best_cl_cd = max(self._episode_best_cl_cd, cl_cd)
+
+        action_norm = float(np.linalg.norm(action[:8])) if np.all(np.isfinite(action[:8])) else float("nan")
+
+        row = {
+            "episode_id": self._episode_id,
+            "step_id": self._episode_step,
+            "global_step": self.num_timesteps,
+            "algorithm": "TD3",
+            "evaluator": getattr(self.cfg, "evaluator", "surrogate") if self.cfg is not None else "surrogate",
+
+            "state_CST_u1": float(prev_cst[0]),
+            "state_CST_u2": float(prev_cst[1]),
+            "state_CST_u3": float(prev_cst[2]),
+            "state_CST_u4": float(prev_cst[3]),
+            "state_CST_l1": float(prev_cst[4]),
+            "state_CST_l2": float(prev_cst[5]),
+            "state_CST_l3": float(prev_cst[6]),
+            "state_CST_l4": float(prev_cst[7]),
+
+            "AoA": getattr(self.cfg, "aoa", ""),
+            "Re": getattr(self.cfg, "re", ""),
+            "log10_Re": np.log10(getattr(self.cfg, "re", 1.0)) if self.cfg is not None else "",
+
+            "CL": info.get("CL", ""),
+            "CD": info.get("CD", ""),
+            "CM": info.get("CM", ""),
+            "CL_CD": info.get("CL_CD", ""),
+            "t_c": info.get("t_c", ""),
+
+            "max_thickness": info.get("max_thickness", ""),
+            "x_max_thickness": info.get("x_max_thickness", ""),
+            "max_camber": info.get("max_camber", ""),
+            "x_max_camber": info.get("x_max_camber", ""),
+            "leading_edge_radius_proxy": info.get("leading_edge_radius_proxy", ""),
+            "trailing_edge_thickness": info.get("trailing_edge_thickness", ""),
+            "upper_surface_curvature_mean": info.get("upper_surface_curvature_mean", ""),
+            "lower_surface_curvature_mean": info.get("lower_surface_curvature_mean", ""),
+            "surface_smoothness": info.get("surface_smoothness", ""),
+            "min_local_thickness": info.get("min_local_thickness", ""),
+            "area_proxy": info.get("area_proxy", ""),
+
+            "action_u1": float(action[0]),
+            "action_u2": float(action[1]),
+            "action_u3": float(action[2]),
+            "action_u4": float(action[3]),
+            "action_l1": float(action[4]),
+            "action_l2": float(action[5]),
+            "action_l3": float(action[6]),
+            "action_l4": float(action[7]),
+            "action_norm": action_norm,
+            "action_max_abs": float(np.nanmax(np.abs(action[:8]))),
+            "action_saturation_count": int(np.sum(np.isclose(np.abs(action[:8]), 1.0, atol=1e-4))),
+
+            "next_CST_u1": float(next_cst[0]),
+            "next_CST_u2": float(next_cst[1]),
+            "next_CST_u3": float(next_cst[2]),
+            "next_CST_u4": float(next_cst[3]),
+            "next_CST_l1": float(next_cst[4]),
+            "next_CST_l2": float(next_cst[5]),
+            "next_CST_l3": float(next_cst[6]),
+            "next_CST_l4": float(next_cst[7]),
+
+            "delta_CST_u1": float(delta_cst[0]),
+            "delta_CST_u2": float(delta_cst[1]),
+            "delta_CST_u3": float(delta_cst[2]),
+            "delta_CST_u4": float(delta_cst[3]),
+            "delta_CST_l1": float(delta_cst[4]),
+            "delta_CST_l2": float(delta_cst[5]),
+            "delta_CST_l3": float(delta_cst[6]),
+            "delta_CST_l4": float(delta_cst[7]),
+
+            "reward_total": info.get("reward_total", reward_value),
+            "reward_objective_term": info.get("reward_objective_term", ""),
+            "reward_CL_CD_term": info.get("reward_CL_CD_term", ""),
+            "reward_CM_penalty": info.get("reward_CM_penalty", ""),
+            "reward_tc_penalty": info.get("reward_tc_penalty", ""),
+            "reward_local_thickness_penalty": info.get("reward_local_thickness_penalty", ""),
+            "reward_invalid_geometry_penalty": info.get("reward_invalid_geometry_penalty", ""),
+            "reward_solver_error_penalty": info.get("reward_solver_error_penalty", ""),
+            "reward_action_penalty": info.get("reward_action_penalty", ""),
+            "penalty_total": info.get("penalty_total", ""),
+            "action_l2_penalty_raw": info.get("action_l2_penalty_raw", ""),
+
+            "CM_lower_violation": info.get("CM_lower_violation", ""),
+            "CM_upper_violation": info.get("CM_upper_violation", ""),
+            "tc_lower_violation": info.get("tc_lower_violation", ""),
+            "tc_upper_violation": info.get("tc_upper_violation", ""),
+            "local_thickness_violation": info.get("local_thickness_violation", ""),
+
+            "is_CM_feasible": info.get("is_CM_feasible", ""),
+            "is_tc_feasible": info.get("is_tc_feasible", ""),
+            "is_geometry_valid": info.get("is_geometry_valid", ""),
+
+            "done": done,
+            "done_reason": info.get("done_reason", ""),
+            "solver_status": info.get("solver_status", ""),
+            "solver_error_message": info.get("solver_error_message", ""),
+        }
+
+        self.train_steps.append(row)
+        self.last_step_row = dict(row)
+
+        self._episode_reward += reward_value
+        self._episode_penalty += penalty_total
+
+        violation_now = (
+            self._float(info.get("CM_lower_violation", 0.0)) > 0.0
+            or self._float(info.get("CM_upper_violation", 0.0)) > 0.0
+            or self._float(info.get("tc_lower_violation", 0.0)) > 0.0
+            or self._float(info.get("tc_upper_violation", 0.0)) > 0.0
+            or not bool(info.get("is_geometry_valid", True))
+        )
+        if violation_now:
+            self._episode_violation_count += 1
+
+        self._episode_step += 1
+
+        if done:
+            self.episode_rows.append(
+                {
+                    "episode_id": self._episode_id,
+                    "initial_CL_CD": self._episode_initial_cl_cd,
+                    "final_CL_CD": cl_cd,
+                    "best_CL_CD": self._episode_best_cl_cd,
+                    "final_CL": info.get("CL", ""),
+                    "final_CD": info.get("CD", ""),
+                    "final_CM": info.get("CM", ""),
+                    "final_t_c": info.get("t_c", ""),
+                    "total_reward": self._episode_reward,
+                    "total_penalty": self._episode_penalty,
+                    "constraint_violation_count": self._episode_violation_count,
+                    "done_reason": info.get("done_reason", ""),
+                    "episode_length": self._episode_step,
+                    "is_final_feasible": bool(info.get("is_CM_feasible", False))
+                    and bool(info.get("is_tc_feasible", False))
+                    and bool(info.get("is_geometry_valid", False)),
+                }
+            )
+
+            self._episode_id += 1
+            self._episode_step = 0
+            self._episode_reward = 0.0
+            self._episode_penalty = 0.0
+            self._episode_violation_count = 0
+            self._episode_best_cl_cd = -float("inf")
+            self._episode_initial_cl_cd = None
+
+    def _log_training_diagnostics(self) -> None:
+        if self.num_timesteps % self.log_every != 0:
+            return
+
+        model = self.model
+
+        if not hasattr(model, "replay_buffer") or model.replay_buffer is None:
+            return
+
+        replay_size = model.replay_buffer.size()
+
+        if replay_size < max(self.batch_size, 2):
+            return
+
+        if hasattr(model, "learning_starts") and self.num_timesteps < model.learning_starts:
+            return
+
+        try:
+            batch = model.replay_buffer.sample(self.batch_size, env=None)
+
+            observations = batch.observations
+            actions = batch.actions
+            rewards = batch.rewards
+            next_observations = batch.next_observations
+            dones = batch.dones
+
+            with torch.no_grad():
+                q1, q2 = model.critic(observations, actions)
+
+                noise = torch.randn_like(actions) * float(model.target_policy_noise)
+                noise = noise.clamp(
+                    -float(model.target_noise_clip),
+                    float(model.target_noise_clip),
+                )
+
+                next_actions = model.actor_target(next_observations)
+                next_actions = (next_actions + noise).clamp(-1.0, 1.0)
+
+                next_q1, next_q2 = model.critic_target(next_observations, next_actions)
+                next_q_min = torch.min(next_q1, next_q2)
+
+                target_q = rewards + (1.0 - dones) * float(model.gamma) * next_q_min
+
+            critic_loss_q1 = float(F.mse_loss(q1, target_q).detach().cpu())
+            critic_loss_q2 = float(F.mse_loss(q2, target_q).detach().cpu())
+
+            actor_actions = model.actor(observations)
+            actor_q1, _ = model.critic(observations, actor_actions)
+            actor_loss = float((-actor_q1.mean()).detach().cpu())
+
+            self.update_id += 1
+
+            row = {
+                "update_id": self.update_id,
+                "critic_loss_Q1": critic_loss_q1,
+                "critic_loss_Q2": critic_loss_q2,
+                "actor_loss": actor_loss,
+                "target_Q_mean": float(target_q.mean().detach().cpu()),
+                "target_Q_std": float(target_q.std(unbiased=False).detach().cpu()),
+                "Q1_mean": float(q1.mean().detach().cpu()),
+                "Q2_mean": float(q2.mean().detach().cpu()),
+                "policy_delay_step": getattr(model, "policy_delay", ""),
+                "learning_rate_actor": self._current_lr(model.actor.optimizer),
+                "learning_rate_critic": self._current_lr(model.critic.optimizer),
+                "gradient_norm_actor": self._grad_norm(model.actor),
+                "gradient_norm_critic": self._grad_norm(model.critic),
+            }
+
+            with open(self.log_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=self.columns)
+                writer.writerow(row)
+
+        except Exception as exc:
+            if self.verbose:
+                print(f"[TD3TrainingDiagnosticsCallback] skipped logging due to: {exc}")
 
     def _on_step(self) -> bool:
-        self.update_id += 1
-        logs = self.model.logger.name_to_value
-        rewards = float(np.asarray(self.locals.get("rewards", [0.0])).reshape(-1)[0])
-        dones = bool(np.asarray(self.locals.get("dones", [False])).reshape(-1)[0])
-        infos = self.locals.get("infos", [{}])
-        info = infos[0] if infos else {}
-        self.last_info = info
-        obs = np.asarray(self.locals.get("new_obs", np.zeros((1,16), dtype=np.float32))).reshape(1,-1)[0]
-        actions = np.asarray(self.locals.get("actions", np.zeros((1,8), dtype=np.float32))).reshape(1,-1)[0]
-        self.train_steps.append({
-            "episode_id": self._ep_id, "step_id": self._ep_len,
-            "reward_total": rewards, "done_reason": info.get("done_reason", "running"),
-            "CL": info.get("CL", np.nan), "CD": info.get("CD", np.nan), "CM": info.get("CM", np.nan), "CL_CD": info.get("CL_CD", np.nan), "t_c": info.get("t_c", np.nan),
-            "action_norm": float(np.linalg.norm(actions)),
-            "state": obs.tolist(), "action": actions.tolist()
-        })
-        self._ep_reward += rewards
-        self._ep_len += 1
-        if dones:
-            self.ep_rows.append({"episode_id": self._ep_id, "total_reward": self._ep_reward, "episode_length": self._ep_len, "done_reason": info.get("done_reason", "")})
-            self._ep_id += 1; self._ep_reward = 0.0; self._ep_len = 0
-
-        self.rows.append({
-            "update_id": self.update_id,
-            "critic_loss_Q1": logs.get("train/critic_loss", ""),
-            "critic_loss_Q2": logs.get("train/critic_loss", ""),
-            "actor_loss": logs.get("train/actor_loss", ""),
-            "target_Q_mean": "",
-            "target_Q_std": "",
-            "Q1_mean": "",
-            "Q2_mean": "",
-            "policy_delay_step": "",
-            "learning_rate_actor": logs.get("train/learning_rate", ""),
-            "learning_rate_critic": logs.get("train/learning_rate", ""),
-            "gradient_norm_actor": "",
-            "gradient_norm_critic": "",
-        })
+        self._log_train_rollout_step()
+        self._log_training_diagnostics()
         return True
 
 
 def _make_evaluator(cfg: ExperimentConfig):
-    if cfg.evaluator.lower() == "surrogate":
-        return SurrogateEvaluator(cfg.surrogate_checkpoint_path, cfg.surrogate_model_name, cfg.scaler_json_path)
-    if cfg.evaluator.lower() == "xfoil":
-        return XFOILEvaluator()
+    evaluator_name = cfg.evaluator.lower()
+
+    if evaluator_name == "surrogate":
+        return SurrogateEvaluator(
+            checkpoint_path=cfg.surrogate_checkpoint_path,
+            model_name=cfg.surrogate_model_name,
+            scaler_json_path=cfg.scaler_json_path,
+        )
+
+    if evaluator_name == "xfoil":
+        raise NotImplementedError(
+            "Real XFOIL evaluator is not enabled yet. "
+            "Do not use --evaluator xfoil until the real XFOIL wrapper is implemented."
+        )
+
     raise ValueError(f"Unsupported evaluator: {cfg.evaluator}")
 
 
@@ -139,18 +521,53 @@ def _create_eval_run_dir(train_run_dir: Path) -> Path:
     return run_dir
 
 
-def train_td3(cfg: ExperimentConfig, base_logs: Path = Path("logs"), checkpoints_dir: Path = Path("checkpoints")) -> Path:
+def train_td3(
+    cfg: ExperimentConfig,
+    base_logs: Path = Path("logs"),
+    checkpoints_dir: Path = Path("checkpoints"),
+) -> Path:
     run_dir = create_run_dir(base_logs, "td3")
     checkpoints_dir.mkdir(exist_ok=True)
 
     env = AirfoilEnv(cfg, _make_evaluator(cfg))
-    n_actions = env.action_space.shape[-1]
-    action_noise = NormalActionNoise(mean=np.zeros(n_actions), sigma=0.1 * np.ones(n_actions))
-    model = TD3("MlpPolicy", env, action_noise=action_noise, seed=cfg.seed, verbose=1)
 
-    cb = TrainingMetricsCallback()
+    td3_cfg = cfg.td3
+
+    n_actions = env.action_space.shape[-1]
+    action_noise = NormalActionNoise(
+        mean=np.zeros(n_actions),
+        sigma=td3_cfg.action_noise_sigma * np.ones(n_actions),
+    )
+
+    model = TD3(
+        "MlpPolicy",
+        env,
+        learning_rate=td3_cfg.learning_rate,
+        buffer_size=td3_cfg.buffer_size,
+        learning_starts=td3_cfg.learning_starts,
+        batch_size=td3_cfg.batch_size,
+        tau=td3_cfg.tau,
+        gamma=td3_cfg.gamma,
+        train_freq=td3_cfg.train_freq,
+        gradient_steps=td3_cfg.gradient_steps,
+        policy_delay=td3_cfg.policy_delay,
+        target_policy_noise=td3_cfg.target_policy_noise,
+        target_noise_clip=td3_cfg.target_noise_clip,
+        action_noise=action_noise,
+        seed=cfg.seed,
+        verbose=1,
+    )
+
+    cb = TD3TrainingDiagnosticsCallback(
+        log_path=run_dir / "training_update_logs.csv",
+        cfg=cfg,
+        log_every=100,
+        batch_size=min(cfg.td3.batch_size, 256),
+        verbose=1,
+    )
     t0 = time.time()
-    model.learn(total_timesteps=cfg.total_timesteps, callback=cb)
+    model.learn(total_timesteps=cfg.total_timesteps,
+    callback=cb)
     train_wall_time = time.time() - t0
 
     ckpt = checkpoints_dir / f"td3_{cfg.evaluator}_{cfg.surrogate_model_name.lower()}.zip"
@@ -159,19 +576,154 @@ def train_td3(cfg: ExperimentConfig, base_logs: Path = Path("logs"), checkpoints
     _write_checkpoint_index(ckpt, run_dir)
 
     write_experiment_metadata(cfg, run_dir, normalization_stats={"source": cfg.scaler_json_path, "train_wall_time_sec": train_wall_time})
-    pd.DataFrame(cb.rows).to_csv(run_dir / "training_update_logs.csv", index=False)
+
     pd.DataFrame(cb.train_steps).to_csv(run_dir / "train_rollout_step_logs.csv", index=False)
     pd.DataFrame(cb.ep_rows).to_csv(run_dir / "train_episode_summary.csv", index=False)
     _write_replay_sample(model, run_dir)
+    last_info = getattr(cb, "last_info", {}) or {}
+    last_step_row = getattr(cb, "last_step_row", {}) or {}
+
+    def _pick_metric(key: str, default=np.nan):
+        if isinstance(last_info, dict) and key in last_info:
+            return last_info.get(key, default)
+        if isinstance(last_step_row, dict) and key in last_step_row:
+            return last_step_row.get(key, default)
+        return default
+
+    # def _as_bool(value) -> bool:
+    #     if isinstance(value, (bool, np.bool_)):
+    #         return bool(value)
+
+    #     if value is None:
+    #         return False
+
+    #     try:
+    #         if pd.isna(value):
+    #             return False
+    #     except Exception:
+    #         pass
+
+    #     return str(value).strip().lower() in {"true", "1", "yes"}
+
+
+    # def _safe_get(row: dict, key: str, default=np.nan):
+    #     if not isinstance(row, dict):
+    #         return default
+    #     return row.get(key, default)
+
+
+    # def _numeric_series(df: pd.DataFrame, col: str) -> pd.Series:
+    #     if col not in df.columns:
+    #         return pd.Series(dtype=float)
+    #     return pd.to_numeric(df[col], errors="coerce")
+
+
+    # def _bool_series(df: pd.DataFrame, col: str) -> pd.Series:
+    #     if col not in df.columns:
+    #         return pd.Series(False, index=df.index)
+    #     return df[col].map(_as_bool)
+    
+    train_steps_df = pd.DataFrame(cb.train_steps)
+
+    if len(train_steps_df) > 0:
+        last_step = train_steps_df.iloc[-1].to_dict()
+    else:
+        last_step = {}
+
+    # Feasible training step seçimi:
+    # CM uygun + t/c uygun + geometri geçerli + CL/CD sayısal
+    if len(train_steps_df) > 0:
+        train_steps_df["CL_CD_numeric"] = pd.to_numeric(
+            train_steps_df.get("CL_CD", np.nan),
+            errors="coerce",
+        )
+
+        train_feasible_mask = (
+            _bool_series(train_steps_df, "is_CM_feasible")
+            & _bool_series(train_steps_df, "is_tc_feasible")
+            & _bool_series(train_steps_df, "is_geometry_valid")
+            & train_steps_df["CL_CD_numeric"].notna()
+        )
+
+        train_feasible_df = train_steps_df[train_feasible_mask].copy()
+    else:
+        train_feasible_df = pd.DataFrame()
+
+    if len(train_feasible_df) > 0:
+        best_train_feasible_row = train_feasible_df.loc[
+            train_feasible_df["CL_CD_numeric"].idxmax()
+        ].to_dict()
+    else:
+        best_train_feasible_row = None
+
+    final_is_feasible = (
+        _as_bool(_safe_get(last_step, "is_CM_feasible", False))
+        and _as_bool(_safe_get(last_step, "is_tc_feasible", False))
+        and _as_bool(_safe_get(last_step, "is_geometry_valid", False))
+    )
+
     train_metrics = {
         "algorithm": "TD3",
         "evaluator": cfg.evaluator,
+        "surrogate_model_name": cfg.surrogate_model_name,
+        "seed": cfg.seed,
+        "total_timesteps": cfg.total_timesteps,
         "train_wall_time_sec": train_wall_time,
-        "final_CL": cb.last_info.get("CL", np.nan),
-        "final_CD": cb.last_info.get("CD", np.nan),
-        "final_CL_CD": cb.last_info.get("CL_CD", np.nan),
-        "final_CM": cb.last_info.get("CM", np.nan),
-        "final_t_c": cb.last_info.get("t_c", np.nan),
+
+        # Training son step / son state
+        "final_CL": _safe_get(last_step, "CL"),
+        "final_CD": _safe_get(last_step, "CD"),
+        "final_CL_CD": _safe_get(last_step, "CL_CD"),
+        "final_CM": _safe_get(last_step, "CM"),
+        "final_t_c": _safe_get(last_step, "t_c"),
+        "final_done_reason": _safe_get(last_step, "done_reason", ""),
+        "final_is_CM_feasible": _safe_get(last_step, "is_CM_feasible", ""),
+        "final_is_tc_feasible": _safe_get(last_step, "is_tc_feasible", ""),
+        "final_is_geometry_valid": _safe_get(last_step, "is_geometry_valid", ""),
+        "final_is_feasible": final_is_feasible,
+
+        # Training boyunca bulunan en iyi feasible step
+        "best_train_feasible_CL": (
+            _safe_get(best_train_feasible_row, "CL")
+            if best_train_feasible_row is not None
+            else np.nan
+        ),
+        "best_train_feasible_CD": (
+            _safe_get(best_train_feasible_row, "CD")
+            if best_train_feasible_row is not None
+            else np.nan
+        ),
+        "best_train_feasible_CL_CD": (
+            _safe_get(best_train_feasible_row, "CL_CD")
+            if best_train_feasible_row is not None
+            else np.nan
+        ),
+        "best_train_feasible_CM": (
+            _safe_get(best_train_feasible_row, "CM")
+            if best_train_feasible_row is not None
+            else np.nan
+        ),
+        "best_train_feasible_t_c": (
+            _safe_get(best_train_feasible_row, "t_c")
+            if best_train_feasible_row is not None
+            else np.nan
+        ),
+        "best_train_feasible_episode_id": (
+            int(_safe_get(best_train_feasible_row, "episode_id", -1))
+            if best_train_feasible_row is not None
+            else -1
+        ),
+        "best_train_feasible_step_id": (
+            int(_safe_get(best_train_feasible_row, "step_id", -1))
+            if best_train_feasible_row is not None
+            else -1
+        ),
+        "has_train_feasible_design": best_train_feasible_row is not None,
+
+        # Log kontrol bilgileri
+        "logged_train_steps": len(getattr(cb, "train_steps", [])),
+        "logged_train_episodes": len(getattr(cb, "ep_rows", [])),
+        "logged_training_diagnostics": getattr(cb, "update_id", 0),
     }
     pd.DataFrame([train_metrics]).to_csv(run_dir / "train_metrics.csv", index=False)
     with open(run_dir / "xai_manifest.json", "w", encoding="utf-8") as f:
@@ -216,8 +768,18 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Optional[Path], episodes: int =
                     "next_CST_u1","next_CST_u2","next_CST_u3","next_CST_u4","next_CST_l1","next_CST_l2","next_CST_l3","next_CST_l4",
                     "delta_CST_u1","delta_CST_u2","delta_CST_u3","delta_CST_u4","delta_CST_l1","delta_CST_l2","delta_CST_l3","delta_CST_l4",
                     "CL_pred","CD_pred","CM_pred","CL_CD_pred","is_CM_feasible","is_tc_feasible","is_geometry_valid",
-                    "reward_total","reward_objective_term","reward_CL_CD_term","reward_CM_penalty","reward_tc_penalty","reward_local_thickness_penalty","reward_invalid_geometry_penalty","reward_solver_error_penalty","penalty_total",
-                    "CM_lower_violation","CM_upper_violation","tc_lower_violation","tc_upper_violation","local_thickness_violation",
+                    "reward_total","reward_objective_term","reward_CL_CD_term","reward_CM_penalty","reward_tc_penalty","reward_local_thickness_penalty","reward_invalid_geometry_penalty","reward_solver_error_penalty","reward_action_penalty","penalty_total","action_l2_penalty_raw",
+                    "CM_lower_violation","CM_upper_violation","tc_lower_violation","tc_upper_violation","local_thickness_violation", "max_thickness",
+                    "x_max_thickness",
+                    "max_camber",
+                    "x_max_camber",
+                    "leading_edge_radius_proxy",
+                    "trailing_edge_thickness",
+                    "upper_surface_curvature_mean",
+                    "lower_surface_curvature_mean",
+                    "surface_smoothness",
+                    "min_local_thickness",
+                    "area_proxy",
                     "done","truncated","terminated","done_reason"]
     policy_cols = ["episode_id","step_id","actor_action_u1","actor_action_u2","actor_action_u3","actor_action_u4","actor_action_l1","actor_action_l2","actor_action_l3","actor_action_l4","Q1","Q2","Q_min","Q_disagreement","target_Q","td_error_Q1","td_error_Q2"]
 
@@ -254,15 +816,55 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Optional[Path], episodes: int =
             nxt, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
 
+            with torch.no_grad():
+                next_obs_t = model.policy.obs_to_tensor(nxt)[0]
+                next_action_t = model.actor_target(next_obs_t)
+                next_q1, next_q2 = model.critic_target(next_obs_t, next_action_t)
+                next_q_min = torch.min(next_q1, next_q2)
+
+                target_q_t = torch.as_tensor(
+                    [[reward]],
+                    dtype=torch.float32,
+                    device=next_q_min.device,
+                )
+
+                if not done:
+                    target_q_t = target_q_t + float(model.gamma) * next_q_min
+
+            q1v = float(q1.detach().cpu().numpy().ravel()[0])
+            q2v = float(q2.detach().cpu().numpy().ravel()[0])
+            target_qv = float(target_q_t.detach().cpu().numpy().ravel()[0])
+
+            td_error_q1 = target_qv - q1v
+            td_error_q2 = target_qv - q2v
+
             norm = float(np.linalg.norm(action)); upper = float(np.linalg.norm(action[:4])); lower = float(np.linalg.norm(action[4:]))
             row = {"experiment_id": run_dir.name, "algorithm": "TD3", "evaluator": cfg.evaluator, "seed": cfg.seed, "episode_id": ep, "step_id": step, "global_step": global_step,
                    "AoA": cfg.aoa, "Re": cfg.re, "log10_Re": np.log10(cfg.re), "CL": info["CL"], "CD": info["CD"], "CM": info["CM"], "CL_CD": info["CL_CD"], "t_c": info["t_c"],
                    "CL_pred": info["CL"], "CD_pred": info["CD"], "CM_pred": info["CM"], "CL_CD_pred": info["CL_CD"],
                    "is_CM_feasible": info["is_CM_feasible"], "is_tc_feasible": info["is_tc_feasible"], "is_geometry_valid": info["is_geometry_valid"],
-                   "reward_total": reward, "reward_objective_term": info["reward_objective_term"], "reward_CL_CD_term": info["reward_objective_term"], "reward_CM_penalty": info["reward_CM_penalty"], "reward_tc_penalty": info["reward_tc_penalty"],
-                   "reward_local_thickness_penalty": 0.0, "reward_invalid_geometry_penalty": 0.0, "reward_solver_error_penalty": 0.0,
-                   "penalty_total": info["reward_CM_penalty"] + info["reward_tc_penalty"],
-                   "CM_lower_violation": info["CM_lower_violation"], "CM_upper_violation": info["CM_upper_violation"], "tc_lower_violation": info["tc_lower_violation"], "tc_upper_violation": info["tc_upper_violation"], "local_thickness_violation": 0.0,
+                   "reward_total": reward,
+                    "reward_objective_term": info.get("reward_objective_term", ""),
+                    "reward_CL_CD_term": info.get("reward_CL_CD_term", info.get("reward_objective_term", "")),
+                    "reward_CM_penalty": info.get("reward_CM_penalty", 0.0),
+                    "reward_tc_penalty": info.get("reward_tc_penalty", 0.0),
+                    "reward_local_thickness_penalty": info.get("reward_local_thickness_penalty", 0.0),
+                    "reward_invalid_geometry_penalty": info.get("reward_invalid_geometry_penalty", 0.0),
+                    "reward_solver_error_penalty": info.get("reward_solver_error_penalty", 0.0),
+                    "reward_action_penalty": info.get("reward_action_penalty", 0.0),
+                    "penalty_total": info.get("penalty_total", 0.0),
+                    "action_l2_penalty_raw": info.get("action_l2_penalty_raw", 0.0),
+                   "CM_lower_violation": info["CM_lower_violation"], "CM_upper_violation": info["CM_upper_violation"], "tc_lower_violation": info["tc_lower_violation"], "tc_upper_violation": info["tc_upper_violation"], "local_thickness_violation": 0.0, "max_thickness": info.get("max_thickness", ""),
+                    "x_max_thickness": info.get("x_max_thickness", ""),
+                    "max_camber": info.get("max_camber", ""),
+                    "x_max_camber": info.get("x_max_camber", ""),
+                    "leading_edge_radius_proxy": info.get("leading_edge_radius_proxy", ""),
+                    "trailing_edge_thickness": info.get("trailing_edge_thickness", ""),
+                    "upper_surface_curvature_mean": info.get("upper_surface_curvature_mean", ""),
+                    "lower_surface_curvature_mean": info.get("lower_surface_curvature_mean", ""),
+                    "surface_smoothness": info.get("surface_smoothness", ""),
+                    "min_local_thickness": info.get("min_local_thickness", ""),
+                    "area_proxy": info.get("area_proxy", ""),
                    "done": done, "truncated": truncated, "terminated": terminated, "done_reason": info["done_reason"],
                    "action_norm": norm, "upper_action_norm": upper, "lower_action_norm": lower, "action_max_abs": float(np.max(np.abs(action))), "action_saturation_count": int(np.sum(np.abs(action) >= 0.999))}
             for i in range(4):
@@ -274,15 +876,29 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Optional[Path], episodes: int =
 
             q1v = float(q1.detach().cpu().numpy().ravel()[0]); q2v = float(q2.detach().cpu().numpy().ravel()[0])
             policy.log({"episode_id": ep, "step_id": step, **{f"actor_action_u{i+1}": float(action[i]) for i in range(4)}, **{f"actor_action_l{i+1}": float(action[4+i]) for i in range(4)},
-                        "Q1": q1v, "Q2": q2v, "Q_min": min(q1v, q2v), "Q_disagreement": abs(q1v-q2v), "target_Q": "", "td_error_Q1": "", "td_error_Q2": ""})
+                        "Q1": q1v, "Q2": q2v, "Q_min": min(q1v, q2v), "Q_disagreement": abs(q1v-q2v), "target_Q": target_qv,
+                        "td_error_Q1": td_error_q1,
+                        "td_error_Q2": td_error_q2,})
 
             total_reward += reward
-            penalties += info["reward_CM_penalty"] + info["reward_tc_penalty"]
+            penalties += float(info.get("penalty_total", 0.0))
             aero_wall_time_sec += float(info.get("aero_wall_time_step_sec", 0.0))
             action_norms.append(norm)
             best_clcd = max(best_clcd, info["CL_CD"])
-            if best_record is None or info["CL_CD"] > best_record["CL_CD"]:
-                best_record = {"episode_id": ep, "step_id": step, "cst": info["next_cst"].copy(), **info}
+            is_step_feasible = (
+                bool(info.get("is_CM_feasible", False))
+                and bool(info.get("is_tc_feasible", False))
+                and bool(info.get("is_geometry_valid", False))
+            )
+
+            if is_step_feasible:
+                if best_record is None or float(info.get("CL_CD", -np.inf)) > float(best_record.get("CL_CD", -np.inf)):
+                    best_record = {
+                        "episode_id": ep,
+                        "step_id": step,
+                        "cst": info["next_cst"].copy(),
+                        **info,
+                    }
             obs = nxt
             step += 1
             global_step += 1
@@ -321,21 +937,70 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Optional[Path], episodes: int =
                 "CL_pred": out.cl, "CD_pred": out.cd, "CM_pred": out.cm, "CL_CD_pred": ratio,
                 "xfoil_converged": True if cfg.evaluator == "xfoil" else "", "xfoil_iterations": "", "xfoil_error_message": "", "runtime_ms": runtime_ms,
             })
-    pd.DataFrame(sweep_rows).to_csv(run_dir / "xfoil_validation_logs.csv", index=False)
+    sweep_filename = f"{cfg.evaluator.lower()}_aoa_sweep_logs.csv"
+    pd.DataFrame(sweep_rows).to_csv(run_dir / sweep_filename, index=False)
     summary_df = pd.DataFrame(summaries)
     best_idx = summary_df["best_CL_CD"].astype(float).idxmax() if len(summary_df) else None
     best_row = summary_df.loc[best_idx] if best_idx is not None else None
+
+    if len(summary_df) > 0:
+        final_mean_CL_CD = pd.to_numeric(
+            summary_df.get("final_CL_CD", np.nan),
+            errors="coerce",
+        ).mean()
+
+        final_feasible_episode_count = int(
+            summary_df.get("is_final_feasible", pd.Series(False, index=summary_df.index))
+            .map(_as_bool)
+            .sum()
+        )
+
+        invalid_geometry_episode_count = int(
+            (
+                summary_df.get("done_reason", pd.Series("", index=summary_df.index))
+                .astype(str)
+                == "invalid_geometry"
+            ).sum()
+        )
+    else:
+        final_mean_CL_CD = np.nan
+        final_feasible_episode_count = 0
+        invalid_geometry_episode_count = 0
     eval_metrics = {
         "algorithm": "TD3",
         "evaluator": cfg.evaluator,
         "aero_wall_time_sec": aero_wall_time_sec,
         "eval_wall_time_sec": time.time() - eval_start,
         "episodes": episodes,
-        "best_CL": float(best_row["final_CL"]) if best_row is not None else np.nan,
-        "best_CD": float(best_row["final_CD"]) if best_row is not None else np.nan,
-        "best_CL_CD": float(best_row["best_CL_CD"]) if best_row is not None else np.nan,
-        "best_CM": float(best_row["final_CM"]) if best_row is not None else np.nan,
-        "best_t_c": float(best_row["final_t_c"]) if best_row is not None else np.nan,
+
+        # Evaluation final-state stabilitesi
+        "final_mean_CL_CD": final_mean_CL_CD,
+        "final_feasible_episode_count": final_feasible_episode_count,
+        "invalid_geometry_episode_count": invalid_geometry_episode_count,
+
+        # Deterministic evaluation boyunca bulunan en iyi feasible tasarım
+        "best_feasible_CL": (
+            float(best_record["CL"]) if best_record is not None else np.nan
+        ),
+        "best_feasible_CD": (
+            float(best_record["CD"]) if best_record is not None else np.nan
+        ),
+        "best_feasible_CL_CD": (
+            float(best_record["CL_CD"]) if best_record is not None else np.nan
+        ),
+        "best_feasible_CM": (
+            float(best_record["CM"]) if best_record is not None else np.nan
+        ),
+        "best_feasible_t_c": (
+            float(best_record["t_c"]) if best_record is not None else np.nan
+        ),
+        "best_feasible_episode_id": (
+            int(best_record["episode_id"]) if best_record is not None else -1
+        ),
+        "best_feasible_step_id": (
+            int(best_record["step_id"]) if best_record is not None else -1
+        ),
+        "has_feasible_design": bool(best_record is not None),
     }
     pd.DataFrame([eval_metrics]).to_csv(run_dir / "eval_metrics.csv", index=False)
 
@@ -351,7 +1016,7 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Optional[Path], episodes: int =
                     "rollout_step_logs.csv",
                     "policy_outputs.csv",
                     "episode_summary.csv",
-                    "xfoil_validation_logs.csv",
+                    sweep_filename,
                     "eval_metrics.csv",
                     "eval_summary.json",
                 ],

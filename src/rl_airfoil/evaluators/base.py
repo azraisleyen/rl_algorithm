@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Dict
+
 import numpy as np
 
 
@@ -10,8 +12,13 @@ class AeroOutput:
     cd: float
     cm: float
     tc: float
+
     is_geometry_valid: bool = True
     solver_status: str = "ok"
+    solver_error_message: str = ""
+    runtime_ms: float = 0.0
+
+    geometry_features: Dict[str, float | bool] = field(default_factory=dict)
 
 
 class Evaluator:
