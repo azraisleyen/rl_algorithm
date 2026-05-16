@@ -4,6 +4,7 @@ import time
 import json
 import numpy as np
 import pandas as pd
+import torch
 from stable_baselines3 import TD3
 from stable_baselines3.common.noise import NormalActionNoise
 from stable_baselines3.common.callbacks import BaseCallback
@@ -162,7 +163,12 @@ def evaluate_td3(cfg: ExperimentConfig, run_dir: Path, episodes: int = 10, aoa_s
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs_t = model.policy.obs_to_tensor(obs)[0]
-            act_t = model.policy.obs_to_tensor(action)[0]
+            # NOTE:
+            # obs_to_tensor() validates input against *observation_space*.
+            # Passing an action vector here causes a shape mismatch on SB3
+            # (expected obs shape=(16,), got action shape=(8,)).
+            # Build action tensor manually for critic forward pass.
+            act_t = torch.as_tensor(action, dtype=torch.float32, device=obs_t.device).reshape(1, -1)
             q1, q2 = model.critic(obs_t, act_t)
             nxt, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
